@@ -37,46 +37,90 @@ def sessions = google.get(
 println " Done. Next page token: ${sessions.data.nextPageToken}"
 
 for (session in sessions.data.session) {
+	if (!session.name) continue;
 	println "Session: ${session.name} ${session.id}"
+	saveSession(google, tokenResp.data.access_token, session.activityType, session.startTimeMillis.toLong() * 1000000, session.endTimeMillis.toLong() * 1000000, true);
+}
+
+print "Getting auto-detected activities..."
+def nowNanos = new Date().getTime() * 1000000;
+def lastWeekNanos = new Date().minus(7).getTime() * 1000000;
+def segments = google.get(
+	path: "/fitness/v1/users/me/dataSources/derived:com.google.activity.segment:com.google.android.gms:merge_activity_segments/datasets/$lastWeekNanos-$nowNanos",
+	headers: [ 'Authorization': "Bearer ${tokenResp.data.access_token}"]
+)
+println " Done."
+
+for (segment in segments.data.point) {
+	if (segment.originDataSourceId.endsWith('session_activity_segment')) continue;
+	if ((segment.endTimeNanos.toLong() - segment.startTimeNanos.toLong()) / 1000000000 < 60) continue;
+	def activityType = segment.value[0].intVal;
+	if (activityType == 1 || activityType == 8) {
+		def startDt = new Date(segment.startTimeNanos.toLong().intdiv(1000000L)).format("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
+		println "Segment: ${activityType == 1 ? 'Biking' : 'Running'} ${startDt}"
+		saveSession(google, tokenResp.data.access_token, activityType, segment.startTimeNanos.toLong(), segment.endTimeNanos.toLong(), false);
+	}
+}
+
+void saveSession(def google, String accessToken, int activityType, long startTimeNanos, long endTimeNanos, boolean accurate) {
 	print "Getting location data..."
+	def locDataSource = 'derived:com.google.location.sample:com.google.android.gms:merge_high_fidelity';
+	if (!accurate) {
+		locDataSource = 'derived:com.google.location.sample:com.google.android.gms:merge_location_samples';
+	}
 	def locData = google.get(
-		path: "/fitness/v1/users/me/dataSources/derived:com.google.location.sample:com.google.android.gms:merge_high_fidelity/datasets/${session.startTimeMillis.toLong() * 1000000}-${session.endTimeMillis.toLong() * 1000000}",
-		headers: [ 'Authorization': "Bearer ${tokenResp.data.access_token}"]
+		path: "/fitness/v1/users/me/dataSources/$locDataSource/datasets/${startTimeNanos}-${endTimeNanos}",
+		headers: [ 'Authorization': "Bearer ${accessToken}"]
 	)
 	println " Done"
 	//println locData.data.point
+	if (!locData.data.point) {
+		println "-- skipped --";
+		return;
+	}
 	print "Getting distance data..."
+	def distDataSource = 'derived:com.google.distance.delta:com.google.android.gms:high_fidelity_from_activity<-derived:com.google.location.sample:com.google.android.gms:merge_high_fidelity';
+	if (!accurate) {
+		distDataSource = 'derived:com.google.distance.delta:com.google.android.gms:merge_distance_delta';
+	}
 	def distanceData = google.get(
-		path: "/fitness/v1/users/me/dataSources/derived:com.google.distance.delta:com.google.android.gms:high_fidelity_from_activity<-derived:com.google.location.sample:com.google.android.gms:merge_high_fidelity/datasets/${session.startTimeMillis.toLong() * 1000000}-${session.endTimeMillis.toLong() * 1000000}",
-		headers: [ 'Authorization': "Bearer ${tokenResp.data.access_token}"]
+		path: "/fitness/v1/users/me/dataSources/$distDataSource/datasets/${startTimeNanos}-${endTimeNanos}",
+		headers: [ 'Authorization': "Bearer ${accessToken}"]
 	)
 	println " Done"
 	//println distanceData.data.point
+	if (!distanceData.data.point) {
+		println "-- skipped --";
+		return;
+	}
 	print "Getting calories data..."
 	def calories = google.get(
-		path: "/fitness/v1/users/me/dataSources/derived:com.google.calories.expended:com.google.android.gms:from_activities/datasets/${session.startTimeMillis.toLong() * 1000000}-${session.endTimeMillis.toLong() * 1000000}",
-		headers: [ 'Authorization': "Bearer ${tokenResp.data.access_token}"]
+		path: "/fitness/v1/users/me/dataSources/derived:com.google.calories.expended:com.google.android.gms:from_activities/datasets/${startTimeNanos}-${endTimeNanos}",
+		headers: [ 'Authorization': "Bearer ${accessToken}"]
 	)
 	println " Done"
 	//println calories.data.point[0].value[0].fpVal
-	def activityType
-	switch(session.activityType) {
+	def activityTypeName
+	switch(activityType) {
 		case 1:
-			activityType = 'Biking'
+			activityTypeName = 'Biking'
 			break
 		case 8:
-			activityType = 'Running'
+			activityTypeName = 'Running'
 			break
 		case 64:
-			activityType = 'Inline skating'
+			activityTypeName = 'Inline skating'
+			break
+		case 67:
+			activityTypeName = 'Cross-country skiing'
 			break
 		default:
-			activityType = 'Unknown'
+			activityTypeName = 'Unknown'
 			break
 	}
-	def fileNameDate = new Date(session.startTimeMillis.toLong()).format("yyyy-MM-dd'T'HH_mm_ssZ")
-	def gmtDate = new Date(session.startTimeMillis.toLong()).format("yyyy-MM-dd'T'HH:mm:ss.SSSX", TimeZone.getTimeZone('GMT'))
-	def xml = new MarkupBuilder(new FileWriter("${fileNameDate}_${activityType.replaceAll(' ', '_')}.tcx"))
+	def fileNameDate = new Date(startTimeNanos.intdiv(1000000L)).format("yyyy-MM-dd'T'HH_mm_ssZ")
+	def gmtDate = new Date(startTimeNanos.intdiv(1000000L)).format("yyyy-MM-dd'T'HH:mm:ss.SSSX", TimeZone.getTimeZone('GMT'))
+	def xml = new MarkupBuilder(new FileWriter("${fileNameDate}_${activityTypeName.replaceAll(' ', '_')}.tcx"))
 	xml.doubleQuotes = true
 	xml.mkp.xmlDeclaration(version: "1.0", encoding: "utf-8")
 	xml.TrainingCenterDatabase(
@@ -89,10 +133,10 @@ for (session in sessions.data.session) {
 		'xsi:schemaLocation': 'http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2 http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd',
 	) {
 		Activities {
-			Activity(Sport: activityType) {
+			Activity(Sport: activityTypeName) {
 				Id(gmtDate)
 				Lap(StartTime: gmtDate) {
-					TotalTimeSeconds((session.endTimeMillis.toLong() - session.startTimeMillis.toLong()) / 1000)
+					TotalTimeSeconds((endTimeNanos - startTimeNanos) / 1000000000)
 					DistanceMeters(distanceData.data.point*.value*.fpVal.sum().sum())
 					Calories(calories.data.point[0].value[0].fpVal)
 					Intensity('Active')
@@ -128,6 +172,4 @@ for (session in sessions.data.session) {
 			PartNumber('000-00000-00')
 		}
 	}
-	//break
 }
-
